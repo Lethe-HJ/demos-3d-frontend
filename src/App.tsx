@@ -1,16 +1,11 @@
 import './App.css'
-import { BrowserRouter, Routes, Route } from 'react-router-dom'
-import LayoutPage from './Layout/Index'
-import Home from './pages/Home'
+import { BrowserRouter } from 'react-router-dom'
+import AppRoutes from './router'
 
 function App() {
   return (
     <BrowserRouter>
-      <Routes>
-        <Route path="/" element={<LayoutPage />}>
-          <Route index element={<Home />} />
-        </Route>
-      </Routes>
+      <AppRoutes />
     </BrowserRouter>
   )
 }

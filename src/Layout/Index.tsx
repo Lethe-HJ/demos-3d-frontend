@@ -1,45 +1,68 @@
 import React from "react";
-import {
-  LaptopOutlined,
-  NotificationOutlined,
-  UserOutlined,
-} from "@ant-design/icons";
-import type { MenuProps } from "antd";
 import { Breadcrumb, Layout, Menu, theme } from "antd";
-import { Outlet } from "react-router-dom";
+import type { MenuProps } from "antd";
+import { Outlet, useLocation, useNavigate } from "react-router-dom";
+import { headerMenuItems, sidebarMenuItems } from "./menuConfig";
 
 const { Header, Content, Sider } = Layout;
 
-const items1: MenuProps["items"] = ["1", "2", "3"].map((key) => ({
-  key,
-  label: `nav ${key}`,
-}));
-
-const items2: MenuProps["items"] = [
-  UserOutlined,
-  LaptopOutlined,
-  NotificationOutlined,
-].map((icon, index) => {
-  const key = String(index + 1);
-
-  return {
-    key: `sub${key}`,
-    icon: React.createElement(icon),
-    label: `subnav ${key}`,
-    children: Array.from({ length: 4 }).map((_, j) => {
-      const subKey = index * 4 + j + 1;
-      return {
-        key: subKey,
-        label: `option${subKey}`,
-      };
-    }),
-  };
-});
-
 const LayoutPage: React.FC = () => {
+  const location = useLocation();
+  const navigate = useNavigate();
   const {
     token: { colorBgContainer, borderRadiusLG },
   } = theme.useToken();
+
+  const selectedKey = location.pathname === "/" ? "/" : location.pathname;
+
+  const findSidebarParentKey = React.useCallback(
+    (path: string) => {
+      for (const item of sidebarMenuItems ?? []) {
+        if (!item || typeof item === "string") continue;
+        if ("children" in item && item.children) {
+          const hasMatch = item.children.some(
+            (child) =>
+              child &&
+              typeof child !== "string" &&
+              "key" in child &&
+              child.key === path
+          );
+          if (hasMatch) {
+            return typeof item.key === "string" ? item.key : undefined;
+          }
+        }
+      }
+      return undefined;
+    },
+    []
+  );
+
+  const [openKeys, setOpenKeys] = React.useState<string[]>(() => {
+    const parentKey = findSidebarParentKey(selectedKey);
+    return parentKey ? [parentKey] : [];
+  });
+
+  React.useEffect(() => {
+    const parentKey = findSidebarParentKey(selectedKey);
+    setOpenKeys(parentKey ? [parentKey] : []);
+  }, [findSidebarParentKey, selectedKey]);
+
+  const handleMenuNavigate: MenuProps["onClick"] = (info) => {
+    if (typeof info.key === "string" && info.key) {
+      navigate(info.key);
+    }
+  };
+
+  const handleSidebarOpenChange: MenuProps["onOpenChange"] = (keys) => {
+    setOpenKeys(keys as string[]);
+  };
+
+  const headerSelectedKeys =
+    headerMenuItems?.some(
+      (item) => item && typeof item !== "string" && item.key === selectedKey
+    )
+      ? [selectedKey]
+      : [];
 
   return (
     <Layout style={{ minHeight: "100%" }}>
@@ -48,9 +71,10 @@ const LayoutPage: React.FC = () => {
         <Menu
           theme="dark"
           mode="horizontal"
-          defaultSelectedKeys={["2"]}
-          items={items1}
+          selectedKeys={headerSelectedKeys}
+          items={headerMenuItems}
           style={{ flex: 1, minWidth: 0 }}
+          onClick={handleMenuNavigate}
         />
       </Header>
       <div style={{ padding: "0 48px" }}>
@@ -65,10 +89,12 @@ const LayoutPage: React.FC = () => {
           <Sider style={{ background: colorBgContainer }} width={200}>
             <Menu
               mode="inline"
-              defaultSelectedKeys={["1"]}
-              defaultOpenKeys={["sub1"]}
+              selectedKeys={[selectedKey]}
+              openKeys={openKeys}
               style={{ height: "100%" }}
-              items={items2}
+              items={sidebarMenuItems}
+              onClick={handleMenuNavigate}
+              onOpenChange={handleSidebarOpenChange}
             />
           </Sider>
           <Content
