@@ -70,14 +70,20 @@ export class ThreeRenderer {
    * 设置场景灯光
    */
   private setupLights(): void {
-    // 环境光
-    const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+    // 柔和环境光，保持整体可见
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
     this.scene.add(ambientLight);
 
-    // 方向光
-    const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
-    directionalLight.position.set(50, 50, 50);
+    // 主方向光，增强明暗与高光
+    const directionalLight = new THREE.DirectionalLight(0xffffff, 1.3);
+    directionalLight.position.set(100, 120, 80);
+    directionalLight.castShadow = false;
     this.scene.add(directionalLight);
+
+    // 辅助点光源，制造高光与体积感（位于另一侧）
+    const pointLight = new THREE.PointLight(0xffffff, 0.9, 0, 2);
+    pointLight.position.set(-80, 60, 120);
+    this.scene.add(pointLight);
   }
 
   /**
@@ -99,18 +105,22 @@ export class ThreeRenderer {
    * @param cellsData 面片索引数据 (ArrayBuffer)
    * @param cellsLength 面片数量
    * @param voxelShape 体素场的维度 [nx, ny, nz]，用于计算旋转中心等信息
+   * @param color 网格颜色（十六进制字符串，如 "#7aa2f7"）
+   * @returns 渲染构建耗时（毫秒）
    */
   updateMesh(
     positionsData: ArrayBuffer,
     positionsLength: number,
     cellsData: ArrayBuffer,
     cellsLength: number,
-    voxelShape: [number, number, number]
-  ): void {
+    voxelShape: [number, number, number],
+    color: string = "#7aa2f7"
+  ): number {
+    const tStart = performance.now();
     // 验证数据长度（避免潜在错误）
     if (positionsLength <= 0 || cellsLength <= 0) {
       console.warn('警告: 无效的网格数据长度', { positionsLength, cellsLength });
-      return;
+      return 0;
     }
     
     // voxelShape 信息用于记录体素场维度（用于调试和将来的扩展功能）
@@ -142,10 +152,12 @@ export class ThreeRenderer {
     geometry.setIndex(new THREE.BufferAttribute(flatIndices, 1));
     geometry.computeVertexNormals();
 
-    // 创建材质
+    // 创建材质（Phong，设置高光与光泽）
     const material = new THREE.MeshPhongMaterial({
-      color: 0x7aa2f7,
-      side: THREE.DoubleSide,
+      color: new THREE.Color(color),
+      specular: new THREE.Color('#ffffff'),
+      shininess: 60,
+      side: THREE.FrontSide,
       flatShading: false,
     });
 
@@ -168,17 +180,14 @@ export class ThreeRenderer {
     }
 
     // 设置旋转中心为体素场的中心
-    // 体素场的原始中心是 (voxelShape[0]/2, voxelShape[1]/2, voxelShape[2]/2)
-    // 由于网格已经居中到原点（mesh.position.sub(center)），
-    // 而体素场的原始中心位置也被平移到原点
-    // 所以旋转中心就是原点 (0, 0, 0)，即体素场的中心
-    // voxelShape 信息保留用于将来可能的扩展（如显示体素场边界框等）
     this.controls.target.set(0, 0, 0);
     this.controls.update();
 
     // 添加到场景
     this.scene.add(mesh);
     this.mesh = mesh;
+
+    return performance.now() - tStart;
   }
 
   /**
