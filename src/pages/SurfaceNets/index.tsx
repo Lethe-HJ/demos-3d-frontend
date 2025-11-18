@@ -1,12 +1,16 @@
 import { useEffect, useRef, useState, useCallback } from "react";
-import { Select, Slider, Row, Col, Card, Space } from "antd";
+import { Select, Slider, Row, Col, Card, Space, InputNumber } from "antd";
 import VoxelGridWorker from "./voxelGrid.worker.ts?worker";
+import ChunkLoaderWorker from "./chunkLoader.worker.ts?worker";
 import { ThreeRenderer } from "./render";
 
 // Worker 消息类型
 interface WorkerLoadMessage {
   type: "load";
-  filename: string;
+  taskId: string;
+  shape: [number, number, number];
+  chunks: Array<{ index: number; start: number; end: number }>;
+  dataBuffer: ArrayBuffer;
   level?: number;
   min?: number;
   max?: number;
@@ -30,6 +34,17 @@ interface WorkerErrorMessage {
 }
 
 type WorkerMessage = WorkerLoadMessage | WorkerResultMessage | WorkerErrorMessage;
+
+// 预处理响应类型
+interface PreprocessResponse {
+  task_id: string;
+  file: string;
+  file_size: number;
+  shape: [number, number, number];
+  data_length: number;
+  chunk_size: number;
+  chunks: Array<{ index: number; start: number; end: number }>;
+}
 
 type WorkerTimings = {
   cacheSource?: string;
@@ -77,11 +92,13 @@ const SurfaceNetsDemo1 = () => {
   
   // UI 状态
   const [filename, setFilename] = useState("CHGDIFF.vasp");
+  const [chunkSize, setChunkSize] = useState(1000000); // 默认 1M 元素
   const [computeEnv, setComputeEnv] = useState("js");
-  const [threadCount, setThreadCount] = useState(1);
+  const [threadCount, setThreadCount] = useState(4); // 默认 4 个 worker
   const [interpolationDensity, setInterpolationDensity] = useState(1);
   const [level, setLevel] = useState<number | null>(null); // 等值面值
   const [dataRange, setDataRange] = useState<{ min: number; max: number } | null>(null); // 数据范围
+  const [taskId, setTaskId] = useState<string | null>(null); // 当前 task ID
   const [lastTimings, setLastTimings] = useState<null | {
     cacheSource: string;
     fetchMs: number;
@@ -121,8 +138,8 @@ const SurfaceNetsDemo1 = () => {
     };
   }, []);
 
-  // 加载体素网格数据
-  const loadVoxelGrid = useCallback((filename: string, levelValue?: number) => {
+  // 加载体素网格数据（分块加载）
+  const loadVoxelGrid = useCallback(async (filename: string, levelValue?: number, currentTaskId?: string | null) => {
     if (!rendererRef.current) {
       setError("渲染器未初始化");
       return;
@@ -131,91 +148,205 @@ const SurfaceNetsDemo1 = () => {
     setLoading(true);
     setError(null);
 
-    // 创建或重用 Worker
-    if (!workerRef.current) {
-      workerRef.current = new VoxelGridWorker();
+    const tStart = performance.now();
+    let preprocessResponse: PreprocessResponse;
 
-      // 处理 Worker 消息
-      workerRef.current.onmessage = (event: MessageEvent<WorkerMessage>) => {
-        const message = event.data;
+    try {
+      // 1. 发送预处理请求
+      const preprocessRes = await fetch("/api/voxel-grid/preprocess", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ file: filename, chunk_size: chunkSize }),
+      });
 
-        if (message.type === "result") {
-          try {
-            const { positionsData, positionsLength, cellsData, cellsLength, shape, min, max, level: resultLevel } = message;
-            
-            // 更新数据范围（只在第一次加载时设置）
-            setDataRange((prevRange) => {
-              if (prevRange === null) {
-                // 首次加载，设置默认 level
-                const def = (min + max) / 2;
-                setLevel(def);
-                setDisplayLevel(def);
-                return { min, max };
-              }
-              return prevRange;
-            });
-            
-            // 计算颜色
-            const color = getColorFromValue(resultLevel, min, max);
-            
-            // 更新渲染器的网格
-            if (rendererRef.current) {
-              const renderMs = rendererRef.current.updateMesh(
-                positionsData,
-                positionsLength,
-                cellsData,
-                cellsLength,
-                shape,
-                color
-              );
+      if (!preprocessRes.ok) {
+        const errorData = await preprocessRes.json().catch(() => ({ error: `HTTP ${preprocessRes.status}` }));
+        throw new Error(errorData.error || `预处理失败: HTTP ${preprocessRes.status}`);
+      }
 
-              // 将耗时信息保存以展示
-              const rec = (message as unknown as { timings?: WorkerTimings }).timings || {};
-              setLastTimings({
-                cacheSource: rec?.cacheSource || 'unknown',
-                fetchMs: rec?.fetchMs ?? 0,
-                decompressMs: rec?.decompressMs ?? 0,
-                parseBinaryMs: rec?.parseBinaryMs ?? 0,
-                rangeMs: rec?.rangeMs ?? 0,
-                backendParseMs: rec?.backendParseMs ?? 0,
-                backendCompressMs: rec?.backendCompressMs ?? 0,
-                backendTotalMs: rec?.backendTotalMs ?? 0,
-                surfaceMs: rec?.surfaceMs ?? 0,
-                packMs: rec?.packMs ?? 0,
-                totalWorkerMs: rec?.totalWorkerMs ?? 0,
-                renderMs,
+      preprocessResponse = await preprocessRes.json();
+      const newTaskId = preprocessResponse.task_id;
+      setTaskId(newTaskId);
+
+      // 2. 创建多个 chunkLoader worker 并行加载 chunk
+      // 每个 worker 会计算各自 chunk 的 min/max
+      const chunkLoaders: Worker[] = [];
+      const chunkPromises: Promise<{ 
+        chunkIndex: number; 
+        buffer: ArrayBuffer; 
+        min: number;
+        max: number;
+        timings: { fetchMs: number } 
+      }>[] = [];
+
+      const activeWorkerCount = Math.min(threadCount, preprocessResponse.chunks.length);
+
+      for (let i = 0; i < preprocessResponse.chunks.length; i++) {
+        const chunk = preprocessResponse.chunks[i];
+        const workerIndex = i % activeWorkerCount;
+
+        // 复用 worker 或创建新的
+        if (chunkLoaders.length <= workerIndex) {
+          const worker = new ChunkLoaderWorker();
+          chunkLoaders.push(worker);
+        }
+
+        const worker = chunkLoaders[workerIndex];
+        const promise = new Promise<{ 
+          chunkIndex: number; 
+          buffer: ArrayBuffer; 
+          min: number;
+          max: number;
+          timings: { fetchMs: number } 
+        }>((resolve, reject) => {
+          const handler = (e: MessageEvent) => {
+            if (e.data.type === "chunk" && e.data.chunkIndex === chunk.index) {
+              worker.removeEventListener("message", handler);
+              resolve({
+                chunkIndex: chunk.index,
+                buffer: e.data.buffer,
+                min: e.data.min,
+                max: e.data.max,
+                timings: e.data.timings,
               });
+            } else if (e.data.type === "error" && e.data.chunkIndex === chunk.index) {
+              worker.removeEventListener("message", handler);
+              reject(new Error(e.data.error));
             }
+          };
+          worker.addEventListener("message", handler);
+          worker.postMessage({
+            type: "fetch-chunk",
+            taskId: newTaskId,
+            chunkIndex: chunk.index,
+            start: chunk.start,
+            length: chunk.end - chunk.start,
+          });
+        });
 
-            setLoading(false);
-          } catch (err) {
-            setError(
-              err instanceof Error ? err.message : "渲染网格时出错"
-            );
+        chunkPromises.push(promise);
+      }
+
+      // 3. 等待所有 chunk 加载完成并合并
+      const chunkResults = await Promise.all(chunkPromises);
+      chunkLoaders.forEach((w) => w.terminate());
+
+      // 按 chunkIndex 排序
+      chunkResults.sort((a, b) => a.chunkIndex - b.chunkIndex);
+
+      // 合并所有 chunk 数据，并计算全局 min/max
+      const totalLength = chunkResults.reduce((sum, r) => sum + r.buffer.byteLength / 8, 0);
+      const mergedData = new Float64Array(totalLength);
+      let offset = 0;
+      const totalFetchMs = chunkResults.reduce((sum, r) => sum + r.timings.fetchMs, 0);
+
+      // 计算全局 min/max（从所有 chunk 的 min/max 中取）
+      let globalMin = chunkResults[0]?.min ?? 0;
+      let globalMax = chunkResults[0]?.max ?? 0;
+      for (const result of chunkResults) {
+        const chunkArray = new Float64Array(result.buffer);
+        mergedData.set(chunkArray, offset);
+        offset += chunkArray.length;
+        
+        // 更新全局 min/max
+        if (result.min < globalMin) globalMin = result.min;
+        if (result.max > globalMax) globalMax = result.max;
+      }
+
+      // 更新数据范围（只在第一次加载时设置）
+      setDataRange((prevRange) => {
+        if (prevRange === null) {
+          const def = (globalMin + globalMax) / 2;
+          setLevel(def);
+          setDisplayLevel(def);
+          return { min: globalMin, max: globalMax };
+        }
+        return prevRange;
+      });
+
+      // 保存用于回调的变量
+      const finalTotalFetchMs = totalFetchMs;
+      const finalMin = globalMin;
+      const finalMax = globalMax;
+
+
+      // 4. 创建或重用 VoxelGrid Worker 进行 surfaceNets 处理
+      if (!workerRef.current) {
+        workerRef.current = new VoxelGridWorker();
+
+        workerRef.current.onmessage = (event: MessageEvent<WorkerMessage>) => {
+          const message = event.data;
+
+          if (message.type === "result") {
+            try {
+              const { positionsData, positionsLength, cellsData, cellsLength, shape, min, max, level: resultLevel } = message;
+
+              // 计算颜色
+              const color = getColorFromValue(resultLevel, min, max);
+
+              // 更新渲染器的网格
+              if (rendererRef.current) {
+                const renderMs = rendererRef.current.updateMesh(
+                  positionsData,
+                  positionsLength,
+                  cellsData,
+                  cellsLength,
+                  shape,
+                  color
+                );
+
+                // 将耗时信息保存以展示
+                const rec = (message as unknown as { timings?: WorkerTimings }).timings || {};
+                setLastTimings({
+                  cacheSource: rec?.cacheSource || 'unknown',
+                  fetchMs: finalTotalFetchMs,
+                  decompressMs: rec?.decompressMs ?? 0,
+                  parseBinaryMs: rec?.parseBinaryMs ?? 0,
+                  rangeMs: rec?.rangeMs ?? 0,
+                  backendParseMs: 0, // 不再统计，因为预处理是异步的
+                  backendCompressMs: 0,
+                  backendTotalMs: 0,
+                  surfaceMs: rec?.surfaceMs ?? 0,
+                  packMs: rec?.packMs ?? 0,
+                  totalWorkerMs: rec?.totalWorkerMs ?? 0,
+                  renderMs,
+                });
+              }
+
+              setLoading(false);
+            } catch (err) {
+              setError(err instanceof Error ? err.message : "渲染网格时出错");
+              setLoading(false);
+            }
+          } else if (message.type === "error") {
+            setError(message.error || "加载数据时出错");
             setLoading(false);
           }
-        } else if (message.type === "error") {
-          setError(message.error || "加载数据时出错");
+        };
+
+        workerRef.current.onerror = (error) => {
+          setError(`Worker 错误: ${error.message}`);
           setLoading(false);
-        }
-      };
+        };
+      }
 
-      workerRef.current.onerror = (error) => {
-        setError(`Worker 错误: ${error.message}`);
-        setLoading(false);
+      // 5. 发送合并后的数据给 VoxelGrid Worker
+      const message: WorkerLoadMessage = {
+        type: "load",
+        taskId: newTaskId,
+        shape: preprocessResponse.shape,
+        chunks: preprocessResponse.chunks,
+        dataBuffer: mergedData.buffer,
+        level: levelValue,
+        min: finalMin,
+        max: finalMax,
       };
+      workerRef.current.postMessage(message, [mergedData.buffer]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "加载数据时出错");
+      setLoading(false);
     }
-
-    // 发送加载请求
-    const message: WorkerLoadMessage = {
-      type: "load",
-      filename,
-      level: levelValue,
-      min: dataRange?.min,
-      max: dataRange?.max,
-    };
-    workerRef.current.postMessage(message);
-  }, [dataRange]);
+  }, [chunkSize, threadCount, dataRange]);
 
   // 组件挂载时自动加载数据
   useEffect(() => {
@@ -223,12 +354,12 @@ const SurfaceNetsDemo1 = () => {
       // 只在首次加载时执行，不传 level（使用默认值）
       loadVoxelGrid(filename);
     }
-  }, [filename]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [filename, chunkSize, threadCount]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // 当 level 改变时重新计算（需要等待数据范围加载完成）
   useEffect(() => {
-    if (level !== null && rendererRef.current && dataRange) {
-      loadVoxelGrid(filename, level);
+    if (level !== null && rendererRef.current && dataRange && taskId) {
+      loadVoxelGrid(filename, level, taskId);
     }
   }, [level]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -264,6 +395,38 @@ const SurfaceNetsDemo1 = () => {
           
           <Col span={6}>
             <div>
+              <div style={{ marginBottom: 8, color: "#7aa2f7" }}>分块大小 (元素数)</div>
+              <InputNumber
+                value={chunkSize}
+                onChange={(val) => val && setChunkSize(val)}
+                style={{ width: "100%" }}
+                min={1000}
+                step={100000}
+                formatter={(value) => `${value}`.replace(/\B(?=(\d{3})+(?!\d))/g, ',')}
+                parser={(value) => value!.replace(/\$\s?|(,*)/g, '')}
+              />
+            </div>
+          </Col>
+          
+          <Col span={6}>
+            <div>
+              <div style={{ marginBottom: 8, color: "#7aa2f7" }}>Worker 线程数</div>
+              <Select
+                value={threadCount}
+                onChange={setThreadCount}
+                style={{ width: "100%" }}
+                options={[
+                  { label: "1", value: 1 },
+                  { label: "2", value: 2 },
+                  { label: "4", value: 4 },
+                  { label: "8", value: 8 }
+                ]}
+              />
+            </div>
+          </Col>
+          
+          <Col span={6}>
+            <div>
               <div style={{ marginBottom: 8, color: "#7aa2f7" }}>选择计算环境</div>
               <Select
                 value={computeEnv}
@@ -271,34 +434,6 @@ const SurfaceNetsDemo1 = () => {
                 style={{ width: "100%" }}
                 options={[
                   { label: "js", value: "js" }
-                ]}
-              />
-            </div>
-          </Col>
-          
-          <Col span={6}>
-            <div>
-              <div style={{ marginBottom: 8, color: "#7aa2f7" }}>选择线程数量</div>
-              <Select
-                value={threadCount}
-                onChange={setThreadCount}
-                style={{ width: "100%" }}
-                options={[
-                  { label: "1", value: 1 }
-                ]}
-              />
-            </div>
-          </Col>
-          
-          <Col span={6}>
-            <div>
-              <div style={{ marginBottom: 8, color: "#7aa2f7" }}>选择线性插值密度</div>
-              <Select
-                value={interpolationDensity}
-                onChange={setInterpolationDensity}
-                style={{ width: "100%" }}
-                options={[
-                  { label: "1", value: 1 }
                 ]}
               />
             </div>
