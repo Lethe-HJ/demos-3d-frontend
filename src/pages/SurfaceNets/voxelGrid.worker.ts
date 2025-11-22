@@ -3,6 +3,10 @@
 // @ts-expect-error - surfacenets.js 没有类型定义
 import { surfaceNets } from "./surfacenets.js";
 
+// 动态导入性能追踪器（Worker 环境）
+let tracker: any = null;
+let sessionId: string | null = null;
+
 type WorkerInputMessage =
   | {
       type: "load";
@@ -13,6 +17,8 @@ type WorkerInputMessage =
       level?: number;
       min?: number;
       max?: number;
+      sessionId?: string; // 性能追踪会话 ID
+      workerIndex?: number; // Worker 索引，用于标识线程
     };
 
 type WorkerOutputMessage =
@@ -42,13 +48,43 @@ self.addEventListener("message", async (event: MessageEvent<WorkerInputMessage>)
   if (event.data.type !== "load") return;
 
   try {
-    const tStart = performance.now();
-    const { taskId, shape, chunks, dataBuffer, level, min, max } = event.data;
-
+    const { taskId, shape, chunks, dataBuffer, level, min, max, sessionId: newSessionId, workerIndex } = event.data;
+    
+    // 初始化 tracker（如果 sessionId 变化或 tracker 未初始化）
+    if (newSessionId && newSessionId !== sessionId) {
+      sessionId = newSessionId;
+      try {
+        // 动态导入 tracker（Worker 环境）
+        const { createTracker } = await import('../../common/performance/tracker');
+        tracker = createTracker({
+          enabled: true,
+          sessionId: newSessionId,
+        });
+      } catch (err) {
+        console.error('[VoxelGrid Worker] 初始化 tracker 失败:', err);
+      }
+    }
+    
+    // 使用 worker线程标识作为 channelIndex
+    const workerThreadId = workerIndex !== undefined ? `chunk合并线程${workerIndex}` : 'chunk合并线程0';
+    
+    const tStart = Date.now();
     const data = new Float64Array(dataBuffer);
     const selectedLevel = level !== undefined ? level : (min! + max!) / 2;
 
-    const tSurfaceStart = performance.now();
+    // 记录数据解析时间
+    const parseEndTime = Date.now();
+    if (tracker) {
+      tracker.recordEvent(
+        'compute',
+        workerThreadId,
+        'VoxelGrid Worker 解析数据',
+        tStart,
+        parseEndTime,
+      );
+    }
+
+    const tSurfaceStart = Date.now();
     const [xm, ym, zm] = shape;
     const potential = (x: number, y: number, z: number): number => {
       const i = Math.floor(x) - 1;
@@ -66,9 +102,21 @@ self.addEventListener("message", async (event: MessageEvent<WorkerInputMessage>)
       shape[2] + 2,
     ];
     const result = surfaceNets(extendedShape, potential, undefined);
-    const surfaceMs = performance.now() - tSurfaceStart;
+    const surfaceEndTime = Date.now();
+    const surfaceMs = surfaceEndTime - tSurfaceStart;
+    
+    // 记录等值面计算时间
+    if (tracker) {
+      tracker.recordEvent(
+        'compute',
+        workerThreadId,
+        '等值面计算 (VoxelGrid Worker)',
+        tSurfaceStart,
+        surfaceEndTime,
+      );
+    }
 
-    const tPackStart = performance.now();
+    const tPackStart = Date.now();
     const flatPositions = new Float32Array(result.positions.length * 3);
     for (let i = 0; i < result.positions.length; i++) {
       flatPositions[i * 3] = result.positions[i][0];
@@ -76,7 +124,29 @@ self.addEventListener("message", async (event: MessageEvent<WorkerInputMessage>)
       flatPositions[i * 3 + 2] = result.positions[i][2];
     }
     const flatCells = new Uint32Array(result.cells.flat());
-    const packMs = performance.now() - tPackStart;
+    const packEndTime = Date.now();
+    const packMs = packEndTime - tPackStart;
+    
+    // 记录打包时间
+    if (tracker) {
+      tracker.recordEvent(
+        'compute',
+        workerThreadId,
+        '打包顶点/索引 (VoxelGrid Worker)',
+        tPackStart,
+        packEndTime,
+      );
+      
+      // 记录 Worker 总处理时间
+      const totalEndTime = Date.now();
+      tracker.recordEvent(
+        'worker',
+        workerThreadId,
+        'VoxelGrid Worker 总处理时间',
+        tStart,
+        totalEndTime,
+      );
+    }
 
     const message: WorkerOutputMessage = {
       type: "result",
@@ -91,7 +161,7 @@ self.addEventListener("message", async (event: MessageEvent<WorkerInputMessage>)
       timings: {
         surfaceMs,
         packMs,
-        totalWorkerMs: performance.now() - tStart,
+        totalWorkerMs: Date.now() - tStart,
       },
     };
     ctx.postMessage(message, [flatPositions.buffer, flatCells.buffer]);

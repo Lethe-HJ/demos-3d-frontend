@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState, useCallback } from "react";
-import { Select, Slider, Row, Col, Card, Space, InputNumber } from "antd";
+import { Select, Slider, Row, Col, Card, Space, InputNumber, Button } from "antd";
 import VoxelGridWorker from "./voxelGrid.worker.ts?worker";
-import ChunkLoaderWorker from "./chunkLoader.worker.ts?worker";
 import { ThreeRenderer } from "./render";
+import { dataSource } from "./dataSource";
+import { createTracker, performanceDB, FlameGraph, recordPerformanceFromResponse } from "@/common/performance";
+import type { PerformanceSession } from "@/common/performance";
 
 // Worker 消息类型
 interface WorkerLoadMessage {
@@ -14,6 +16,7 @@ interface WorkerLoadMessage {
   level?: number;
   min?: number;
   max?: number;
+  sessionId?: string; // 性能追踪会话 ID
 }
 
 interface WorkerResultMessage {
@@ -47,14 +50,7 @@ interface PreprocessResponse {
 }
 
 type WorkerTimings = {
-  cacheSource?: string;
   fetchMs?: number;
-  decompressMs?: number;
-  parseBinaryMs?: number;
-  rangeMs?: number;
-  backendParseMs?: number;
-  backendCompressMs?: number;
-  backendTotalMs?: number;
   surfaceMs?: number;
   packMs?: number;
   totalWorkerMs?: number;
@@ -92,27 +88,18 @@ const SurfaceNetsDemo1 = () => {
   
   // UI 状态
   const [filename, setFilename] = useState("CHGDIFF.vasp");
-  const [chunkSize, setChunkSize] = useState(1000000); // 默认 1M 元素
+  const [chunkSize, setChunkSize] = useState(1e5); // 默认 10w 元素
   const [computeEnv, setComputeEnv] = useState("js");
-  const [threadCount, setThreadCount] = useState(4); // 默认 4 个 worker
+  // Worker 线程数固定为 5 个
+  const THREAD_COUNT = 5;
   const [interpolationDensity, setInterpolationDensity] = useState(1);
   const [level, setLevel] = useState<number | null>(null); // 等值面值
   const [dataRange, setDataRange] = useState<{ min: number; max: number } | null>(null); // 数据范围
   const [taskId, setTaskId] = useState<string | null>(null); // 当前 task ID
-  const [lastTimings, setLastTimings] = useState<null | {
-    cacheSource: string;
-    fetchMs: number;
-    decompressMs: number;
-    parseBinaryMs: number;
-    rangeMs: number;
-    backendParseMs: number;
-    backendCompressMs: number;
-    backendTotalMs: number;
-    surfaceMs: number;
-    packMs: number;
-    totalWorkerMs: number;
-    renderMs: number;
-  }>(null);
+  // 性能分析相关状态
+  const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
+  const [showPerformance, setShowPerformance] = useState(false);
+  const [performanceSession, setPerformanceSession] = useState<PerformanceSession | null>(null);
   // 滑动条防抖：显示值与实际触发值分离
   const [displayLevel, setDisplayLevel] = useState<number | null>(null);
   const debounceTimerRef = useRef<number | null>(null);
@@ -148,101 +135,44 @@ const SurfaceNetsDemo1 = () => {
     setLoading(true);
     setError(null);
 
-    const tStart = performance.now();
-    let preprocessResponse: PreprocessResponse;
+    // 创建性能追踪器
+    const tracker = createTracker({
+      enabled: true,
+      metadata: { filename, chunkSize, taskId: null },
+      });
+    const sessionId = tracker.getSessionId();
+    setCurrentSessionId(sessionId);
+    
+    // 初始化 IndexedDB
+    await performanceDB.init();
 
     try {
-      // 1. 发送预处理请求
-      const preprocessRes = await fetch("/api/voxel-grid/preprocess", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ file: filename, chunk_size: chunkSize }),
-      });
-
-      if (!preprocessRes.ok) {
-        const errorData = await preprocessRes.json().catch(() => ({ error: `HTTP ${preprocessRes.status}` }));
-        throw new Error(errorData.error || `预处理失败: HTTP ${preprocessRes.status}`);
-      }
-
-      preprocessResponse = await preprocessRes.json();
-      const newTaskId = preprocessResponse.task_id;
+      // 使用 dataSource 统一处理数据获取逻辑
+      const loadResult = await dataSource.loadData(filename, chunkSize, tracker);
+      
+      const { chunks: chunkResults, shape, dataLength, taskId: newTaskId, fetchMs: totalFetchMs } = loadResult;
+      
+      if (newTaskId) {
       setTaskId(newTaskId);
-
-      // 2. 创建多个 chunkLoader worker 并行加载 chunk
-      // 每个 worker 会计算各自 chunk 的 min/max
-      const chunkLoaders: Worker[] = [];
-      const chunkPromises: Promise<{ 
-        chunkIndex: number; 
-        buffer: ArrayBuffer; 
-        min: number;
-        max: number;
-        timings: { fetchMs: number } 
-      }>[] = [];
-
-      const activeWorkerCount = Math.min(threadCount, preprocessResponse.chunks.length);
-
-      for (let i = 0; i < preprocessResponse.chunks.length; i++) {
-        const chunk = preprocessResponse.chunks[i];
-        const workerIndex = i % activeWorkerCount;
-
-        // 复用 worker 或创建新的
-        if (chunkLoaders.length <= workerIndex) {
-          const worker = new ChunkLoaderWorker();
-          chunkLoaders.push(worker);
-        }
-
-        const worker = chunkLoaders[workerIndex];
-        const promise = new Promise<{ 
-          chunkIndex: number; 
-          buffer: ArrayBuffer; 
-          min: number;
-          max: number;
-          timings: { fetchMs: number } 
-        }>((resolve, reject) => {
-          const handler = (e: MessageEvent) => {
-            if (e.data.type === "chunk" && e.data.chunkIndex === chunk.index) {
-              worker.removeEventListener("message", handler);
-              resolve({
-                chunkIndex: chunk.index,
-                buffer: e.data.buffer,
-                min: e.data.min,
-                max: e.data.max,
-                timings: e.data.timings,
-              });
-            } else if (e.data.type === "error" && e.data.chunkIndex === chunk.index) {
-              worker.removeEventListener("message", handler);
-              reject(new Error(e.data.error));
-            }
-          };
-          worker.addEventListener("message", handler);
-          worker.postMessage({
-            type: "fetch-chunk",
-            taskId: newTaskId,
-            chunkIndex: chunk.index,
-            start: chunk.start,
-            length: chunk.end - chunk.start,
-          });
-        });
-
-        chunkPromises.push(promise);
+        // 更新 tracker 的 metadata
+        tracker.updateMetadata({ taskId: newTaskId });
       }
-
-      // 3. 等待所有 chunk 加载完成并合并
-      const chunkResults = await Promise.all(chunkPromises);
-      chunkLoaders.forEach((w) => w.terminate());
-
-      // 按 chunkIndex 排序
-      chunkResults.sort((a, b) => a.chunkIndex - b.chunkIndex);
 
       // 合并所有 chunk 数据，并计算全局 min/max
+      const mergeStartTime = Date.now();
+      tracker.startEvent('merge_chunks', 'compute', 0, `合并chunk数据 (${chunkResults.length}个)`);
+      
       const totalLength = chunkResults.reduce((sum, r) => sum + r.buffer.byteLength / 8, 0);
       const mergedData = new Float64Array(totalLength);
       let offset = 0;
-      const totalFetchMs = chunkResults.reduce((sum, r) => sum + r.timings.fetchMs, 0);
 
       // 计算全局 min/max（从所有 chunk 的 min/max 中取）
       let globalMin = chunkResults[0]?.min ?? 0;
       let globalMax = chunkResults[0]?.max ?? 0;
+      
+      const minMaxStartTime = Date.now();
+      tracker.startEvent('calc_minmax', 'compute', 0, '计算全局min/max');
+      
       for (const result of chunkResults) {
         const chunkArray = new Float64Array(result.buffer);
         mergedData.set(chunkArray, offset);
@@ -252,6 +182,12 @@ const SurfaceNetsDemo1 = () => {
         if (result.min < globalMin) globalMin = result.min;
         if (result.max > globalMax) globalMax = result.max;
       }
+      
+      const minMaxEndTime = Date.now();
+      tracker.endEvent('calc_minmax');
+      
+      const mergeEndTime = Date.now();
+      tracker.endEvent('merge_chunks');
 
       // 更新数据范围（只在第一次加载时设置）
       setDataRange((prevRange) => {
@@ -271,21 +207,32 @@ const SurfaceNetsDemo1 = () => {
 
 
       // 4. 创建或重用 VoxelGrid Worker 进行 surfaceNets 处理
+      const voxelWorkerStartTime = Date.now();
       if (!workerRef.current) {
+        tracker.recordEvent('worker', 0, '创建VoxelGrid Worker', voxelWorkerStartTime, voxelWorkerStartTime, 0);
         workerRef.current = new VoxelGridWorker();
 
-        workerRef.current.onmessage = (event: MessageEvent<WorkerMessage>) => {
+        workerRef.current.onmessage = async (event: MessageEvent<WorkerMessage>) => {
           const message = event.data;
+          const resultReceiveTime = performance.now();
 
           if (message.type === "result") {
             try {
               const { positionsData, positionsLength, cellsData, cellsLength, shape, min, max, level: resultLevel } = message;
 
+              // Worker 中的性能数据已经由 Worker 自己记录了，这里不需要重复记录
+
               // 计算颜色
+              const colorStartTime = Date.now();
+              tracker.startEvent('calc_color', 'compute', 0, '计算颜色');
               const color = getColorFromValue(resultLevel, min, max);
+              tracker.endEvent('calc_color');
 
               // 更新渲染器的网格
               if (rendererRef.current) {
+                const renderStartTime = Date.now();
+                tracker.startEvent('render_mesh', 'render', 0, '渲染网格');
+                
                 const renderMs = rendererRef.current.updateMesh(
                   positionsData,
                   positionsLength,
@@ -295,23 +242,11 @@ const SurfaceNetsDemo1 = () => {
                   color
                 );
 
-                // 将耗时信息保存以展示
-                const rec = (message as unknown as { timings?: WorkerTimings }).timings || {};
-                setLastTimings({
-                  cacheSource: rec?.cacheSource || 'unknown',
-                  fetchMs: finalTotalFetchMs,
-                  decompressMs: rec?.decompressMs ?? 0,
-                  parseBinaryMs: rec?.parseBinaryMs ?? 0,
-                  rangeMs: rec?.rangeMs ?? 0,
-                  backendParseMs: 0, // 不再统计，因为预处理是异步的
-                  backendCompressMs: 0,
-                  backendTotalMs: 0,
-                  surfaceMs: rec?.surfaceMs ?? 0,
-                  packMs: rec?.packMs ?? 0,
-                  totalWorkerMs: rec?.totalWorkerMs ?? 0,
-                  renderMs,
-                });
+                tracker.endEvent('render_mesh');
               }
+              
+              // 完成会话
+              await tracker.complete();
 
               setLoading(false);
             } catch (err) {
@@ -330,23 +265,33 @@ const SurfaceNetsDemo1 = () => {
         };
       }
 
-      // 5. 发送合并后的数据给 VoxelGrid Worker
+      // 发送合并后的数据给 VoxelGrid Worker
+      const sendStartTime = Date.now();
+      tracker.startEvent('send_to_worker', 'worker', 0, '发送数据到VoxelGrid Worker');
+      
       const message: WorkerLoadMessage = {
         type: "load",
-        taskId: newTaskId,
-        shape: preprocessResponse.shape,
-        chunks: preprocessResponse.chunks,
+        taskId: newTaskId || '',
+        shape: shape,
+        chunks: chunkResults.map((r) => ({ index: r.chunkIndex, start: 0, end: 0 })), // chunks 信息在 worker 中不需要使用
         dataBuffer: mergedData.buffer,
         level: levelValue,
         min: finalMin,
         max: finalMax,
+        sessionId: sessionId, // 传递 sessionId 给 Worker
+        workerIndex: 0, // VoxelGrid Worker 只有一个，使用索引 0
       };
       workerRef.current.postMessage(message, [mergedData.buffer]);
+      
+      tracker.endEvent('send_to_worker');
+      
+      // 保存发送时间，用于后续计算Worker处理时间
+      (workerRef.current as any)._lastSendTime = { value: sendStartTime };
     } catch (err) {
       setError(err instanceof Error ? err.message : "加载数据时出错");
       setLoading(false);
     }
-  }, [chunkSize, threadCount, dataRange]);
+  }, [chunkSize, dataRange]);
 
   // 组件挂载时自动加载数据
   useEffect(() => {
@@ -354,7 +299,7 @@ const SurfaceNetsDemo1 = () => {
       // 只在首次加载时执行，不传 level（使用默认值）
       loadVoxelGrid(filename);
     }
-  }, [filename, chunkSize, threadCount]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [filename, chunkSize]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // 当 level 改变时重新计算（需要等待数据范围加载完成）
   useEffect(() => {
@@ -410,23 +355,6 @@ const SurfaceNetsDemo1 = () => {
           
           <Col span={6}>
             <div>
-              <div style={{ marginBottom: 8, color: "#7aa2f7" }}>Worker 线程数</div>
-              <Select
-                value={threadCount}
-                onChange={setThreadCount}
-                style={{ width: "100%" }}
-                options={[
-                  { label: "1", value: 1 },
-                  { label: "2", value: 2 },
-                  { label: "4", value: 4 },
-                  { label: "8", value: 8 }
-                ]}
-              />
-            </div>
-          </Col>
-          
-          <Col span={6}>
-            <div>
               <div style={{ marginBottom: 8, color: "#7aa2f7" }}>选择计算环境</div>
               <Select
                 value={computeEnv}
@@ -474,23 +402,82 @@ const SurfaceNetsDemo1 = () => {
         </Row>
       </Card>
       
-      {lastTimings && (
-        <Card title="性能统计" size="small" style={{ marginBottom: 16 }}>
-          <Row gutter={[16, 8]}>
-            <Col span={6}>缓存来源: {lastTimings.cacheSource}</Col>
-            <Col span={6}>网络获取: {lastTimings.fetchMs.toFixed(2)} ms</Col>
-            <Col span={6}>解压: {lastTimings.decompressMs.toFixed(2)} ms</Col>
-            <Col span={6}>解析头/数据: {lastTimings.parseBinaryMs.toFixed(2)} ms</Col>
-            <Col span={6}>计算范围: {lastTimings.rangeMs.toFixed(2)} ms</Col>
-            <Col span={6}>后端解析: {lastTimings.backendParseMs.toFixed(2)} ms</Col>
-            <Col span={6}>后端压缩: {lastTimings.backendCompressMs.toFixed(2)} ms</Col>
-            <Col span={6}>后端总耗时: {lastTimings.backendTotalMs.toFixed(2)} ms</Col>
-            <Col span={6}>等值面计算: {lastTimings.surfaceMs.toFixed(2)} ms</Col>
-            <Col span={6}>打包顶点/索引: {lastTimings.packMs.toFixed(2)} ms</Col>
-            <Col span={6}>Worker总耗时: {lastTimings.totalWorkerMs.toFixed(2)} ms</Col>
-            <Col span={6}>渲染构建: {lastTimings.renderMs.toFixed(2)} ms</Col>
-          </Row>
+      {/* 性能分析按钮 */}
+      <Card size="small" style={{ marginBottom: 16 }}>
+        <Space>
+          <Button 
+            type="primary" 
+            onClick={async () => {
+              if (currentSessionId) {
+                await performanceDB.init();
+                
+                // 先从 IndexedDB 加载本地性能数据
+                let session = await performanceDB.getSession(currentSessionId);
+                
+                // 从后端获取性能数据
+                try {
+                  console.log('[性能分析] 请求后端性能数据，sessionId:', currentSessionId);
+                  const response = await fetch(`/api/performance?session_id=${encodeURIComponent(currentSessionId)}`);
+                  console.log('[性能分析] 后端响应状态:', response.status);
+                  if (response.ok) {
+                    const backendData = await response.json();
+                    const backendRecords = (backendData.records || []).map((r: any) => ({
+                      startTime: r.start_time,
+                      endTime: r.end_time,
+                      channelGroup: r.channel_group,
+                      channelIndex: r.channel_index,
+                      msg: r.msg,
+                    }));
+                    
+                    // 合并后端记录到本地 session
+                    if (session) {
+                      session.records = [...session.records, ...backendRecords];
+                      // 重新计算会话时间范围
+                      const allTimes = session.records.flatMap(r => [r.startTime, r.endTime]);
+                      session.sessionStartTime = Math.min(...allTimes);
+                      session.sessionEndTime = Math.max(...allTimes);
+                    } else {
+                      // 如果没有本地 session，创建一个新的
+                      session = {
+                        sessionId: currentSessionId,
+                        sessionStartTime: backendRecords.length > 0 
+                          ? Math.min(...backendRecords.map(r => r.startTime))
+                          : Date.now(),
+                        sessionEndTime: backendRecords.length > 0
+                          ? Math.max(...backendRecords.map(r => r.endTime))
+                          : Date.now(),
+                        records: backendRecords,
+                      };
+                    }
+                  } else {
+                    const errorData = await response.json().catch(() => ({}));
+                    console.error('[性能分析] 后端返回错误:', errorData);
+                  }
+                } catch (err) {
+                  console.error('[性能分析] 从后端加载性能数据失败:', err);
+                }
+                
+                if (session) {
+                  setPerformanceSession(session);
+                  setShowPerformance(true);
+                }
+              }
+            }}
+            disabled={!currentSessionId}
+          >
+            查看性能分析
+          </Button>
+          {showPerformance && (
+            <Button onClick={() => setShowPerformance(false)}>
+              关闭性能分析
+            </Button>
+          )}
+        </Space>
         </Card>
+
+      {/* 性能火焰图 */}
+      {showPerformance && performanceSession && (
+        <FlameGraph session={performanceSession} />
       )}
 
       <div
