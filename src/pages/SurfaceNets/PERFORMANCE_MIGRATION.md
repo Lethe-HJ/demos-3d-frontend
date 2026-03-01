@@ -20,15 +20,22 @@
 
 ```typescript
 // 创建追踪器
-import { createTracker, performanceDB } from '@/common/performance';
-const tracker = createTracker({ 
+import { PerformanceTracker, performanceDB } from "@/common/performance";
+const tracker = new PerformanceTracker({
   enabled: true,
-  metadata: { filename, chunkSize }
+  metadata: { filename, chunkSize },
 });
 
 // 记录事件
-tracker.recordEvent('network', 0, '发送预处理请求', startTime, endTime);
-tracker.recordEvent('compute', 0, '合并chunk数据', startTime, endTime, duration);
+tracker.recordEvent("network", 0, "发送预处理请求", startTime, endTime);
+tracker.recordEvent(
+  "compute",
+  0,
+  "合并chunk数据",
+  startTime,
+  endTime,
+  duration
+);
 
 // 完成会话
 await tracker.complete();
@@ -36,4 +43,3 @@ await tracker.complete();
 // 加载会话
 const session = await performanceDB.getSession(sessionId);
 ```
-

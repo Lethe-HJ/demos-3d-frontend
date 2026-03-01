@@ -16,6 +16,17 @@ export default defineConfig({
   define: {
     __DEV__: 'import.meta.env.DEV',
   },
+  // 为 Worker 环境配置全局变量
+  // Vite 的 define 默认会应用到所有文件（包括 worker），但显式配置确保 worker 环境也能正确访问
+  worker: {
+    format: 'es',
+    plugins: () => [],
+    rollupOptions: {
+      output: {
+        format: 'es',
+      },
+    },
+  },
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),

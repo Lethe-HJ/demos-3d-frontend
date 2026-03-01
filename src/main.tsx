@@ -4,6 +4,7 @@ import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import './index.css'
 import App from './App.tsx'
+import './global.ts'
 
 // 声明全局 __DEV__ 类型（由 vite.config.ts 中的 define 配置提供）
 declare const __DEV__: boolean

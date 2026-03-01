@@ -11,7 +11,7 @@ import type { PerformanceSession, PerformanceRecord, ChannelGroupConfig } from '
 import { CHANNEL_GROUPS } from './tracker';
 
 interface FlameGraphProps {
-  session: PerformanceSession;
+  session: PerformanceSession | null;
 }
 
 const FlameGraph: React.FC<FlameGraphProps> = ({ session }) => {
@@ -20,18 +20,62 @@ const FlameGraph: React.FC<FlameGraphProps> = ({ session }) => {
 
   // 处理数据，转换为 ECharts 格式
   const chartData = useMemo(() => {
-    if (!session || !session.records || session.records.length === 0) return null;
+    if (!session || !session.records || session.records.length === 0) {
+      console.log("[FlameGraph] session 或 records 为空");
+      return null;
+    }
+
+    console.log("[FlameGraph] 开始处理数据，记录数:", session.records.length);
+    console.log("[FlameGraph] 第一条记录示例:", session.records[0]);
+    
+    // 统计各 channelGroup 的记录数
+    const groupStats: Record<string, number> = {};
+    session.records.forEach((record) => {
+      const group = record.channelGroup || "unknown";
+      groupStats[group] = (groupStats[group] || 0) + 1;
+    });
+    console.log("[FlameGraph] 各 channelGroup 的记录数:", groupStats);
 
     // 计算时间范围（从 Unix 时间戳转换为相对时间）
-    const sessionStartTime = session.sessionStartTime;
-    const sessionEndTime = session.sessionEndTime;
+    // 如果 sessionStartTime 或 sessionEndTime 无效，从记录中重新计算
+    let sessionStartTime = session.sessionStartTime;
+    let sessionEndTime = session.sessionEndTime;
+    
+    if (
+      isNaN(sessionStartTime) ||
+      isNaN(sessionEndTime) ||
+      !isFinite(sessionStartTime) ||
+      !isFinite(sessionEndTime)
+    ) {
+      // 从记录中重新计算时间范围
+      const allTimes = session.records
+        .flatMap((r) => [r.startTime, r.endTime])
+        .filter((t) => typeof t === "number" && !isNaN(t) && isFinite(t));
+      
+      if (allTimes.length > 0) {
+        sessionStartTime = Math.min(...allTimes);
+        sessionEndTime = Math.max(...allTimes);
+      } else {
+        // 如果没有有效的时间戳，返回 null 不显示图表
+        return null;
+      }
+    }
+    
     const totalDuration = sessionEndTime - sessionStartTime; // 总耗时（毫秒）
     const maxTime = totalDuration / 1000; // 转换为秒
+    
+    if (!isFinite(maxTime) || maxTime <= 0) {
+      return null;
+    }
 
     // 按 channelGroup 和 channelIndex 分组
     const recordsByGroup: Record<string, PerformanceRecord[]> = {};
     
     session.records.forEach((record) => {
+      if (!record.channelGroup || record.channelGroup === undefined) {
+        console.warn("[FlameGraph] 记录缺少 channelGroup:", record);
+        return;
+      }
       const key = `${record.channelGroup}_${record.channelIndex}`;
       if (!recordsByGroup[key]) {
         recordsByGroup[key] = [];
@@ -44,6 +88,9 @@ const FlameGraph: React.FC<FlameGraphProps> = ({ session }) => {
     const groupsMap: Record<string, Map<string, PerformanceRecord[]>> = {};
     
     session.records.forEach((record) => {
+      if (!record.channelGroup || record.channelGroup === undefined) {
+        return; // 跳过无效记录
+      }
       if (!groupsMap[record.channelGroup]) {
         groupsMap[record.channelGroup] = new Map();
       }
@@ -55,6 +102,20 @@ const FlameGraph: React.FC<FlameGraphProps> = ({ session }) => {
       groupsMap[record.channelGroup].get(indexKey)!.push(record);
     });
 
+    console.log("[FlameGraph] 分组后的 groupsMap:", Object.keys(groupsMap));
+    // 详细记录每个组的记录数
+    Object.keys(groupsMap).forEach((groupName) => {
+      const groupRecords = groupsMap[groupName];
+      const totalRecords = Array.from(groupRecords.values()).reduce(
+        (sum, records) => sum + records.length,
+        0
+      );
+      console.log(
+        `[FlameGraph] Group "${groupName}" 有 ${totalRecords} 条记录，channelIndexes:`,
+        Array.from(groupRecords.keys())
+      );
+    });
+
     // 为每个行计算层级（处理重叠）
     // 同一个 channelIndex 的所有记录应该在同一行，重叠的记录放在不同层
     const channelLayers: Record<string, Map<string, PerformanceRecord[][]>> = {};
@@ -62,6 +123,8 @@ const FlameGraph: React.FC<FlameGraphProps> = ({ session }) => {
     Object.keys(groupsMap).forEach((groupName) => {
       channelLayers[groupName] = new Map();
       const indexMap = groupsMap[groupName];
+      
+      console.log(`[FlameGraph] 处理组 "${groupName}" 的层级计算，有 ${indexMap.size} 个不同的 channelIndex`);
       
       indexMap.forEach((records, indexKey) => {
         const layers: PerformanceRecord[][] = [];
@@ -96,21 +159,69 @@ const FlameGraph: React.FC<FlameGraphProps> = ({ session }) => {
         
         // 使用字符串 key 存储，确保同一 channelIndex 在同一行
         channelLayers[groupName].set(indexKey, layers);
+        console.log(
+          `[FlameGraph] Group "${groupName}" channelIndex "${indexKey}" 有 ${layers.length} 层，共 ${records.length} 条记录`
+        );
       });
     });
+    
+    console.log("[FlameGraph] channelLayers 构建完成，组数:", Object.keys(channelLayers).length);
 
     // 构建 series 数据
     const series: echarts.SeriesOption[] = [];
     const yAxisData: string[] = [];
     
+    // 获取所有存在的组，包括未配置的组
+    const allGroupNames = Object.keys(channelLayers);
+    const configuredGroups = new Set(Object.keys(CHANNEL_GROUPS));
+    
+    // 为未配置的组创建默认配置
+    const defaultColorPalette = [
+      "#4a90e2", "#f5a623", "#50e3c2", "#7aa2f7", "#bb9af7", 
+      "#9ece6a", "#e0af68", "#f7768e", "#7dcfff", "#a9b1d6"
+    ];
+    let defaultOrder = 100; // 未配置的组放在最后
+    
     // 按 channelGroup 的顺序处理
     const groupOrder = Object.values(CHANNEL_GROUPS).sort((a, b) => a.order - b.order);
     
+    // 先处理已配置的组
     groupOrder.forEach((groupConfig) => {
       const groupName = groupConfig.name;
       const layers = channelLayers[groupName];
       
-      if (!layers || layers.size === 0) return;
+      if (!layers || layers.size === 0) {
+        console.log(`[FlameGraph] Group "${groupName}" 没有数据，跳过`);
+        return;
+      }
+      
+      console.log(`[FlameGraph] 处理已配置的组: "${groupName}"`);
+      processGroup(groupName, groupConfig, layers);
+    });
+    
+    // 再处理未配置的组
+    allGroupNames.forEach((groupName) => {
+      if (!configuredGroups.has(groupName)) {
+        const layers = channelLayers[groupName];
+        if (!layers || layers.size === 0) return;
+        
+        const defaultConfig: ChannelGroupConfig = {
+          name: groupName,
+          displayName: groupName,
+          color: defaultColorPalette[defaultOrder % defaultColorPalette.length],
+          order: defaultOrder++,
+        };
+        
+        console.log(`[FlameGraph] 使用默认配置处理未配置的组: ${groupName}`);
+        processGroup(groupName, defaultConfig, layers);
+      }
+    });
+    
+    function processGroup(
+      groupName: string,
+      groupConfig: ChannelGroupConfig,
+      layers: Map<string, PerformanceRecord[][]>
+    ) {
       
       // 按 channelIndex 排序（支持数字和字符串）
       const sortedIndexes = Array.from(layers.keys()).sort((a, b) => {
@@ -195,7 +306,16 @@ const FlameGraph: React.FC<FlameGraphProps> = ({ session }) => {
           });
         });
       });
-    });
+    }
+
+    console.log("[FlameGraph] 生成的 series 数量:", series.length);
+    console.log("[FlameGraph] yAxisData 数量:", yAxisData.length);
+    console.log("[FlameGraph] maxTime:", maxTime);
+
+    if (series.length === 0) {
+      console.warn("[FlameGraph] 没有生成任何 series，可能没有有效的记录");
+      return null;
+    }
 
     return {
       maxTime,
@@ -357,13 +477,40 @@ const FlameGraph: React.FC<FlameGraphProps> = ({ session }) => {
     return (
       <Card title="性能时间轴（火焰图）" size="small">
         <div style={{ padding: 20, textAlign: 'center', color: '#999' }}>
-          暂无性能数据
+          {!session ? (
+            <div>
+              <div style={{ marginBottom: 8 }}>⚠️ 未找到性能数据</div>
+              <div style={{ fontSize: '12px', color: '#666' }}>
+                请确保已完成一次数据加载操作
+              </div>
+            </div>
+          ) : (
+            <div>
+              <div style={{ marginBottom: 8 }}>📊 暂无性能记录</div>
+              <div style={{ fontSize: '12px', color: '#666' }}>
+                会话 ID: {session.sessionId}
+              </div>
+            </div>
+          )}
         </div>
       </Card>
     );
   }
 
-  const totalDuration = (session.sessionEndTime - session.sessionStartTime) / 1000;
+  // 计算总耗时，如果时间范围无效则从记录中计算
+  let totalDuration = (session.sessionEndTime - session.sessionStartTime) / 1000;
+  if (isNaN(totalDuration) || !isFinite(totalDuration)) {
+    const allTimes = session.records
+      .flatMap((r) => [r.startTime, r.endTime])
+      .filter((t) => typeof t === "number" && !isNaN(t) && isFinite(t));
+    if (allTimes.length > 0) {
+      const minTime = Math.min(...allTimes);
+      const maxTime = Math.max(...allTimes);
+      totalDuration = (maxTime - minTime) / 1000;
+    } else {
+      totalDuration = 0;
+    }
+  }
 
   return (
     <Card 

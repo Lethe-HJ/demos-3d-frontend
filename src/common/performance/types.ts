@@ -59,9 +59,10 @@ export interface ChannelGroupConfig {
  * 性能追踪器配置
  */
 export interface PerformanceTrackerConfig {
-  /** 是否启用 */
-  enabled: boolean;
-  /** 会话 ID（如果不提供则自动生成） */
+  /** 行组 */
+  group: string;
+  threadId: string;
+  /** 会话 ID */
   sessionId?: string;
   /** 会话元数据 */
   metadata?: PerformanceSession['metadata'];

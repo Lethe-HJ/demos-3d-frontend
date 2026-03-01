@@ -12,7 +12,7 @@ export interface PerformanceEvent {
     chunkIndex?: number;
     workerId?: number;
     fromCache?: boolean;
-    [key: string]: any;
+    [key: string]: unknown;
   };
 }
 
@@ -34,14 +34,14 @@ export class PerformanceTracker {
   /**
    * 开始记录一个事件
    */
-  startEvent(
+  startRecord(
     name: string,
     category: PerformanceEvent['category'],
     metadata?: PerformanceEvent['metadata']
   ): void {
     // 如果之前有未结束的事件，先结束它
     if (this.currentEvent) {
-      this.endEvent();
+      this.endRecord();
     }
 
     const relativeStart = performance.now() - this.startTime;
@@ -56,7 +56,7 @@ export class PerformanceTracker {
   /**
    * 结束当前事件
    */
-  endEvent(): void {
+  endRecord(): void {
     if (!this.currentEvent) return;
 
     const endTime = performance.now();
@@ -99,7 +99,7 @@ export class PerformanceTracker {
   getTrace(): PerformanceTrace {
     // 确保最后一个事件也结束
     if (this.currentEvent) {
-      this.endEvent();
+      this.endRecord();
     }
 
     const endTime = performance.now();
